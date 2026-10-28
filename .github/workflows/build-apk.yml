@@ -36,6 +36,87 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+      - name: Patch unsafe audio monitoring
+        working-directory: MaqamLive-Android
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          path = Path('app/src/main/java/com/maqamlive/app/LiveAudio.kt')
+          source = path.read_text(encoding='utf-8')
+          def patch(old, new):
+              global source
+              if source.count(old) != 1:
+                  raise RuntimeError('Expected exactly one audio-code anchor: ' + repr(old))
+              source = source.replace(old, new, 1)
+
+          patch('import android.media.AudioAttributes\n',
+                'import android.media.AudioAttributes\nimport android.media.AudioDeviceInfo\n')
+          patch('        val sampleRate = manager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)\n',
+                '''        // Do not start monitoring unless Android reports a real wired output.
+                  val wired = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                  } ?: error("وصل سماعات سلكية مناسبة قبل المراقبة الصوتية")
+                  val sampleRate = manager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+          ''')
+          patch('        record = input\n        track = output\n',
+                '''        if (!output.setPreferredDevice(wired)) {
+            input.release(); output.release()
+            error("تعذر توجيه الصوت للسماعات السلكية")
+                  }
+                  output.setVolume(0.10f)
+                  record = input
+                  track = output
+          ''')
+          patch('            val out = ShortArray(256)\n',
+                '''            val out = ShortArray(256)
+            var samplesPlayed = 0L
+            var loudFrames = 0
+          ''')
+          patch('                output.play()\n                input.startRecording()\n',
+                '''                output.play()
+                // Check the *actual* route after starting with silence only.
+                val silence = ShortArray(512)
+                output.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
+                Thread.sleep(80)
+                if (!running) return@thread
+                if (output.routedDevice?.id != wired.id) {
+                    error("موقوف للأمان: مخرج الصوت ليس السماعات السلكية")
+                }
+                input.startRecording()
+          ''')
+          patch('                while (running) {\n                    val n = input.read',
+                '''                while (running) {
+                    if (output.routedDevice?.id != wired.id) {
+                        error("موقوف للأمان: تغير مخرج الصوت")
+                    }
+                    val n = input.read''')
+          patch('                    dsp.process(mic, n, out, tuning)\n                    frequencyHz = dsp.detectedFrequencyHz\n',
+                '''                    var loudSamples = 0
+                    for (i in 0 until n) {
+                        if (kotlin.math.abs(mic[i].toInt()) >= 23000) loudSamples++
+                    }
+                    loudFrames = if (loudSamples > n / 8) loudFrames + 1 else 0
+                    if (loudFrames >= 3) error("موقوف للأمان: دخل صوت مرتفع جدا إلى الميكروفون")
+                    dsp.process(mic, n, out, tuning)
+                    frequencyHz = dsp.detectedFrequencyHz
+                    // In addition to AudioTrack gain: 5% PCM limit and one-second fade in.
+                    for (i in 0 until n) {
+                        val fade = (samplesPlayed / sampleRate.toFloat()).coerceIn(0f, 1f)
+                        out[i] = (out[i].toInt() * 0.05f * fade).toInt().toShort()
+                        samplesPlayed++
+                    }
+          ''')
+          patch('                    val written = output.write(out, 0, n, AudioTrack.WRITE_BLOCKING)\n',
+                '''                    if (output.routedDevice?.id != wired.id) {
+                        error("موقوف للأمان: فصل السماعات")
+                    }
+                    val written = output.write(out, 0, n, AudioTrack.WRITE_BLOCKING)
+          ''')
+          path.write_text(source, encoding='utf-8')
+          print('Audio safety patch applied')
+          PYTHON
       - name: Build debug APK
         working-directory: MaqamLive-Android
         run: sed -i 's/fillViewport/isFillViewport/g' app/src/main/java/com/maqamlive/app/MainActivity.kt && gradle :app:assembleDebug --no-daemon --stacktrace
@@ -45,3 +126,4 @@ jobs:
           name: MaqamLive-debug-APK
           path: MaqamLive-Android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          
