@@ -1,4 +1,4 @@
-name: Build MaqamLive APK
+name: Build MaqamLive APK - Sonic Arabic Maqams (safe preview)
 
 on:
   workflow_dispatch:
@@ -36,94 +36,158 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Patch unsafe audio monitoring
+      - name: Download and verify Apache-2.0 Sonic engine
+        run: |
+          set -euo pipefail
+          mkdir -p MaqamLive-Android/app/src/main/java/sonic MaqamLive-Android/third_party/sonic
+          # Pinned upstream revision: https://github.com/waywardgeek/sonic
+          rev=b93885dcb70aae50c6f76b0fe4e0868f029a077e
+          curl -fL --retry 3 "https://raw.githubusercontent.com/waywardgeek/sonic/$rev/Sonic.java" -o MaqamLive-Android/app/src/main/java/sonic/Sonic.java
+          curl -fL --retry 3 "https://raw.githubusercontent.com/waywardgeek/sonic/$rev/LICENSE" -o MaqamLive-Android/third_party/sonic/LICENSE
+          test "$(git hash-object MaqamLive-Android/app/src/main/java/sonic/Sonic.java)" = 3a2594009f45f9c432ab83bfb674cffb8f2f9d87
+          test "$(git hash-object MaqamLive-Android/third_party/sonic/LICENSE)" = d645695673349e3947e8e5ae42332d0ac3164cd7
+      - name: Integrate Sonic with existing Arabic maqam tuning and disable unverified live playback
         working-directory: MaqamLive-Android
         run: |
-          python3 - <<'PYTHON'
+          python3 - <<'PY'
           from pathlib import Path
-          path = Path('app/src/main/java/com/maqamlive/app/LiveAudio.kt')
-          source = path.read_text(encoding='utf-8')
-          def patch(old, new):
-              global source
-              if source.count(old) != 1:
-                  raise RuntimeError('Expected exactly one audio-code anchor: ' + repr(old))
-              source = source.replace(old, new, 1)
-
-          patch('import android.media.AudioAttributes\n',
-                'import android.media.AudioAttributes\nimport android.media.AudioDeviceInfo\n')
-          patch('        val sampleRate = manager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)\n',
-                '''        // Do not start monitoring unless Android reports a real wired output.
-                  val wired = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-                  } ?: error("وصل سماعات سلكية مناسبة قبل المراقبة الصوتية")
-                  val sampleRate = manager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
-          ''')
-          patch('        record = input\n        track = output\n',
-                '''        if (!output.setPreferredDevice(wired)) {
-            input.release(); output.release()
-            error("تعذر توجيه الصوت للسماعات السلكية")
+          dsp = Path('app/src/main/java/com/maqamlive/app/Dsp.kt')
+          s = dsp.read_text(encoding='utf-8')
+          assert s.count('import kotlin.math.sqrt\n') == 1
+          s = s.replace('import kotlin.math.sqrt\n', 'import kotlin.math.sqrt\nimport sonic.Sonic\n', 1)
+          old = '    private val shifter = DualGrainPitchShifter()\n'
+          assert s.count(old) == 1
+          s = s.replace(old, '''    // Apache-2.0 library: https://github.com/waywardgeek/sonic
+              private val sonic = Sonic(sampleRate, 1)
+              private val pending = ShortArray(32768)
+              private val sonicOutput = ShortArray(4096)
+              private var pendingRead = 0
+              private var pendingWrite = 0
+              private var pendingCount = 0
+          ''', 1)
+          start = s.index('    fun process(input: ShortArray, count: Int, output: ShortArray, tuning: Tuning) {')
+          end = s.index('\n}\n\nprivate class MonophonicPitchDetector', start)
+          s = s[:start] + '''    fun process(input: ShortArray, count: Int, output: ShortArray, tuning: Tuning) {
+                  require(count in 0..input.size && output.size >= count)
+                  // Preserve the project's YIN-like detector and Arabic microtonal note grid.
+                  for (i in 0 until count) detector.feed(input[i] / 32768.0f)
+                  val hz = detector.frequencyHz
+                  detectedFrequencyHz = hz
+                  val desired = if (hz > 0.0 && tuning.correction > 0.001)
+                      MaqamMath.ratio(hz, tuning) else 1.0
+                  smoothRatio += (desired - smoothRatio) * 0.20
+                  sonic.setPitch(smoothRatio.toFloat().coerceIn(0.77f, 1.30f))
+                  sonic.writeShortToStream(input, count)
+                  while (true) {
+                      val n = sonic.readShortFromStream(sonicOutput, sonicOutput.size)
+                      if (n <= 0) break
+                      for (i in 0 until n) {
+                          check(pendingCount < pending.size) { "Sonic output queue full" }
+                          pending[pendingWrite] = sonicOutput[i]
+                          pendingWrite = (pendingWrite + 1) % pending.size
+                          pendingCount++
+                      }
                   }
-                  output.setVolume(0.10f)
-                  record = input
-                  track = output
-          ''')
-          patch('            val out = ShortArray(256)\n',
-                '''            val out = ShortArray(256)
-            var samplesPlayed = 0L
-            var loudFrames = 0
-          ''')
-          patch('                output.play()\n                input.startRecording()\n',
-                '''                output.play()
-                // Check the *actual* route after starting with silence only.
-                val silence = ShortArray(512)
-                output.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
-                Thread.sleep(80)
-                if (!running) return@thread
-                if (output.routedDevice?.id != wired.id) {
-                    error("موقوف للأمان: مخرج الصوت ليس السماعات السلكية")
-                }
-                input.startRecording()
-          ''')
-          patch('                while (running) {\n                    val n = input.read',
-                '''                while (running) {
-                    if (output.routedDevice?.id != wired.id) {
-                        error("موقوف للأمان: تغير مخرج الصوت")
-                    }
-                    val n = input.read''')
-          patch('                    dsp.process(mic, n, out, tuning)\n                    frequencyHz = dsp.detectedFrequencyHz\n',
-                '''                    var loudSamples = 0
-                    for (i in 0 until n) {
-                        if (kotlin.math.abs(mic[i].toInt()) >= 23000) loudSamples++
-                    }
-                    loudFrames = if (loudSamples > n / 8) loudFrames + 1 else 0
-                    if (loudFrames >= 3) error("موقوف للأمان: دخل صوت مرتفع جدا إلى الميكروفون")
-                    dsp.process(mic, n, out, tuning)
-                    frequencyHz = dsp.detectedFrequencyHz
-                    // In addition to AudioTrack gain: 5% PCM limit and one-second fade in.
-                    for (i in 0 until n) {
-                        val fade = (samplesPlayed / sampleRate.toFloat()).coerceIn(0f, 1f)
-                        out[i] = (out[i].toInt() * 0.05f * fade).toInt().toShort()
-                        samplesPlayed++
-                    }
-          ''')
-          patch('                    val written = output.write(out, 0, n, AudioTrack.WRITE_BLOCKING)\n',
-                '''                    if (output.routedDevice?.id != wired.id) {
-                        error("موقوف للأمان: فصل السماعات")
-                    }
-                    val written = output.write(out, 0, n, AudioTrack.WRITE_BLOCKING)
-          ''')
-          path.write_text(source, encoding='utf-8')
-          print('Audio safety patch applied')
-          PYTHON
-      - name: Build debug APK
+                  for (i in 0 until count) {
+                      // Silence while the streaming algorithm fills its initial buffer.
+                      val corrected = if (pendingCount > 0) {
+                          val v = pending[pendingRead] / 32768.0f
+                          pendingRead = (pendingRead + 1) % pending.size
+                          pendingCount--
+                          v
+                      } else 0.0f
+                      val tap1 = echoOne[echoOnePos]
+                      val tap2 = echoTwo[echoTwoPos]
+                      echoOne[echoOnePos] = (corrected + tap1 * 0.31f).coerceIn(-1f, 1f)
+                      echoTwo[echoTwoPos] = (corrected + tap2 * 0.24f).coerceIn(-1f, 1f)
+                      echoOnePos = (echoOnePos + 1) % echoOne.size
+                      echoTwoPos = (echoTwoPos + 1) % echoTwo.size
+                      val wet = tap1 * 0.55f + tap2 * 0.45f
+                      val value = corrected * (1.0 - tuning.echo * 0.35) + wet * tuning.echo * 0.35
+                      // Additional PCM limit; NOT a guarantee against acoustic feedback.
+                      output[i] = (value.coerceIn(-0.25, 0.25) * 32767.0).toInt().toShort()
+                  }
+              }
+          ''' + s[end:]
+          dsp.write_text(s, encoding='utf-8')
+          # Fail closed: this version validates Sonic offline; it never opens an output stream.
+          live = Path('app/src/main/java/com/maqamlive/app/LiveAudio.kt')
+          source = live.read_text(encoding='utf-8')
+          anchor = '        if (running) return\n'
+          assert source.count(anchor) == 1
+          source = source.replace(anchor, anchor +
+              '        error("المراقبة الصوتية متوقفة للأمان حتى اختبار المحرك على الجهاز")\n', 1)
+          live.write_text(source, encoding='utf-8')
+          ui = Path('app/src/main/java/com/maqamlive/app/MainActivity.kt')
+          source = ui.read_text(encoding='utf-8')
+          source = source.replace('fillViewport = true', 'isFillViewport = true')
+          source = source.replace('▶ تشغيل المراقبة الصوتية', 'المراقبة الصوتية متوقفة للأمان')
+          ui.write_text(source, encoding='utf-8')
+          PY
+      - name: Add offline Arabic maqam unit tests
         working-directory: MaqamLive-Android
-        run: sed -i 's/fillViewport/isFillViewport/g' app/src/main/java/com/maqamlive/app/MainActivity.kt && gradle :app:assembleDebug --no-daemon --stacktrace
+        run: |
+          cat >> app/build.gradle.kts <<'GRADLE'
+          dependencies {
+              testImplementation("junit:junit:4.13.2")
+          }
+          GRADLE
+          mkdir -p app/src/test/java/com/maqamlive/app
+          cat > app/src/test/java/com/maqamlive/app/MaqamSonicTest.kt <<'TEST'
+          package com.maqamlive.app
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+          import kotlin.math.PI
+          import kotlin.math.pow
+          import kotlin.math.sin
+          import kotlin.math.abs
+
+          class MaqamSonicTest {
+              private fun hz(midi: Double) = 440.0 * 2.0.pow((midi - 69.0) / 12.0)
+
+              @Test fun rastSupportsMicrotonalThird() {
+                  val tuning = Tuning(maqam = Maqam.presets[0], tonicClass = 0, correction = 1.0)
+                  assertEquals(63.5, MaqamMath.nearestMidi(hz(63.5), tuning)!!, 0.001)
+              }
+
+              @Test fun bayatiSupportsHalfFlatSecond() {
+                  val tuning = Tuning(maqam = Maqam.presets[1], tonicClass = 0, correction = 1.0)
+                  assertEquals(61.5, MaqamMath.nearestMidi(hz(61.5), tuning)!!, 0.001)
+              }
+
+              @Test fun sonicStreamsVoiceWithLimitedPcmLevel() {
+                  val dsp = VoiceDsp(48000)
+                  val tuning = Tuning(correction = 0.8, echo = 0.0)
+                  var peak = 0
+                  var nonzero = 0
+                  for (block in 0 until 220) {
+                      val input = ShortArray(256) { i ->
+                          (sin(2.0 * PI * 440.0 * (block * 256 + i) / 48000.0) * 10000).toInt().toShort()
+                      }
+                      val output = ShortArray(256)
+                      dsp.process(input, input.size, output, tuning)
+                      for (sample in output) {
+                          peak = maxOf(peak, abs(sample.toInt()))
+                          if (sample.toInt() != 0) nonzero++
+                      }
+                  }
+                  assertTrue("Sonic should produce processed samples", nonzero > 200)
+                  assertTrue("PCM must stay under the preview software limit", peak <= 8192)
+              }
+          }
+          TEST
+      - name: Verify Sonic processing and maqam math offline (no audio device)
+        working-directory: MaqamLive-Android
+        run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
+      - name: Build safe preview APK
+        working-directory: MaqamLive-Android
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MaqamLive-debug-APK
+          name: MaqamLive-Sonic-Maqams-OFFLINE-preview
           path: MaqamLive-Android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           
