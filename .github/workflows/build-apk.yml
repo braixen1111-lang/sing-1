@@ -38,7 +38,7 @@ jobs:
           gradle-version: '8.9'
       - name: Build debug APK
         working-directory: MaqamLive-Android
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: run: sed -i 's/fillViewport/isFillViewport/g' app/src/main/java/com/maqamlive/app/MainActivity.kt && gradle :app:assembleDebug --no-daemon --stacktrace
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
